@@ -1,5 +1,7 @@
 # Youcifer Wallpaper
 
+![Uploading image.png…]()
+
 A lightweight Windows wallpaper **switcher** built with **Python** that
 **actually changes the Windows wallpaper** — the same one you see in
 *Settings → Personalization → Background*. No overlay windows, no
