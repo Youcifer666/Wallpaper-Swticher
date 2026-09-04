@@ -252,12 +252,14 @@ class WallpaperManager:
         self,
         path: str,
         monitor_index: int | None = None,
-        style: str = "fill",
+        style: str | None = "fill",
     ) -> None:
         """Apply `path` as the wallpaper.
 
         monitor_index: None = all monitors, otherwise 0-based monitor index.
-        style: fill / fit / stretch / tile / center / span.
+        style: fill / fit / stretch / tile / center / span, or None to leave
+        the current fit style untouched (avoids a redundant SetPosition,
+        which can restart Windows' wallpaper fade).
         """
         if not os.path.isfile(path):
             raise FileNotFoundError(path)
@@ -269,12 +271,22 @@ class WallpaperManager:
                     raise IndexError(f"no monitor {monitor_index}")
                 monitor_id = monitors[monitor_index]["id"]
             self._dw.set_wallpaper(path, monitor_id)
-            try:
-                self._dw.set_position(POSITIONS.get(style, POSITIONS["fill"]))
-            except OSError:
-                pass  # position is cosmetic; ignore failures
+            if style is not None:
+                try:
+                    self._dw.set_position(POSITIONS.get(style, POSITIONS["fill"]))
+                except OSError:
+                    pass  # position is cosmetic; ignore failures
         else:
-            _legacy_set_wallpaper(path, style)
+            _legacy_set_wallpaper(path, style or "fill")
+
+    def get_position(self) -> int | None:
+        """Current DESKTOP_WALLPAPER_POSITION, or None if unavailable."""
+        if self._dw is None:
+            return None
+        try:
+            return self._dw.get_position()
+        except OSError:
+            return None
 
     def get_wallpaper(self, monitor_index: int | None = None) -> str:
         if self._dw is not None:

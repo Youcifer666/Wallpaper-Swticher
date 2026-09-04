@@ -22,8 +22,17 @@ import winreg
 
 from hotkey import GlobalHotkey
 from switcher import SwitcherBar
+
+try:
+    import switcher_flow
+    from switcher_flow import FlowBar, HAVE_QT
+    FLOW_OK = HAVE_QT
+except (ImportError, Exception):
+    FLOW_OK = False
+
 from tray import TrayIcon
-from wallpaper_api import POSITION_NAMES, WallpaperManager
+from transition import TRANSITION_NAMES, WallpaperTransition
+from wallpaper_api import POSITION_NAMES, POSITIONS, WallpaperManager
 import fonts
 
 fonts.register()  # load bundled Alexandria TTFs into this process
@@ -35,6 +44,7 @@ MAX_THUMBS = 400
 
 STYLES = list(POSITION_NAMES.keys())
 INTERVALS = (5, 10, 15, 30, 60)
+LAYOUT_NAMES = {"grid": "Grid Cards", "flow": "Cover Flow"}
 
 
 def default_folder() -> str:
@@ -59,6 +69,13 @@ class WallpaperApp:
         self.monitor = self.settings.get("monitor")   # None = all monitors
         self.interval = int(self.settings.get("interval", 15))
         self.shuffle = bool(self.settings.get("shuffle", True))
+        self.transition = self.settings.get("transition", "circle")
+        if self.transition not in TRANSITION_NAMES:
+            self.transition = "circle"
+        self._transition = WallpaperTransition()
+        self.layout = self.settings.get("layout", "grid")
+        if self.layout not in LAYOUT_NAMES:
+            self.layout = "grid"
 
         self.images: list[str] = []
         self._slideshow_running = False
@@ -72,7 +89,7 @@ class WallpaperApp:
             self.monitors = []
 
         # quick switcher bar (child of the hidden root)
-        self.switcher = SwitcherBar(self)
+        self._make_switcher()
 
         # global hotkey + tray icon, both marshal commands via one queue
         self._events: queue.Queue = queue.Queue()
@@ -89,6 +106,15 @@ class WallpaperApp:
 
         self._load_folder(self.folder)
 
+    # -- switcher layout -----------------------------------------------------------
+
+    def _make_switcher(self) -> None:
+        if self.layout == "flow" and FLOW_OK:
+            self.switcher = FlowBar(self)
+        else:
+            self.switcher = SwitcherBar(self)
+
+
     # -- tray menu ---------------------------------------------------------------
 
     def _tray_menu(self) -> list:
@@ -104,6 +130,10 @@ class WallpaperApp:
                   else "Start Slideshow", "slide", False), ("-",)]
         slide += [(f"Every {n} min", f"interval:{n}", self.interval == n)
                   for n in INTERVALS]
+        trans = [(name, f"transition:{key}", self.transition == key)
+                 for key, name in TRANSITION_NAMES.items()]
+        layout = [(name, f"layout:{key}", self.layout == key)
+                  for key, name in LAYOUT_NAMES.items()]
         return [
             ("Open Switcher  (Alt+W)", "toggle", False),
             ("Random Wallpaper", "random", False),
@@ -112,6 +142,8 @@ class WallpaperApp:
             ("Fit Style", fit),
             ("Monitor", mons),
             ("Slideshow", slide),
+            ("Transition", trans),
+            ("Switcher Layout", layout),
             ("Start with Windows", "startup", self._startup_enabled()),
             ("-",),
             ("Exit", "exit", False),
@@ -128,6 +160,10 @@ class WallpaperApp:
                              f"registered (already in use by another app)")
             while True:
                 event = self._events.get_nowait()
+                if isinstance(event, tuple):
+                    if event[0] == "transition_done":
+                        self._on_transition_done(event[1], event[2], event[3])
+                    continue
                 if event == "toggle":
                     self.switcher.toggle()
                 elif event == "folder":
@@ -155,6 +191,19 @@ class WallpaperApp:
                     self.interval = int(event[9:])
                     self._save_settings()
                     self._status(f"Slideshow interval: {self.interval} min")
+                elif event.startswith("transition:"):
+                    self.transition = event[11:]
+                    self._save_settings()
+                    name = TRANSITION_NAMES[self.transition]
+                    self._status(f"Transition: {name}")
+                elif event.startswith("layout:"):
+                    value = event[7:]
+                    if value != self.layout:
+                        self.layout = value
+                        self._save_settings()
+                        self.switcher.destroy()
+                        self._make_switcher()
+                    self._status(f"Switcher layout: {LAYOUT_NAMES[value]}")
         except queue.Empty:
             pass
         except tk.TclError:
@@ -216,22 +265,60 @@ class WallpaperApp:
         if not os.path.isfile(path):
             self._status(f"File not found: {path}")
             return
+        if self._try_transition(path):
+            return
+        self._set_wallpaper_now(path)
 
-        def do_set() -> None:
-            try:
-                self.manager.set_wallpaper(path, monitor_index=self.monitor,
-                                           style=self.style)
-            except Exception as exc:
-                self._status(f"Could not set wallpaper: {exc}")
-                return
+    def _try_transition(self, path: str) -> bool:
+        """Play the animated transition; returns False to set it directly.
+
+        YASB's engine also skips the animation for per-monitor targets — the
+        overlay covers every monitor, so a single-monitor change would show
+        the new wallpaper on screens it was not applied to.
+        """
+        if self.transition == "off" or self.monitor is not None:
+            return False
+        style, animation = self.style, self.transition
+
+        def commit() -> None:
+            # A fresh manager: its COM interface must live on the thread that
+            # calls it, and this runs while the overlay's final frame is up.
+            mgr = WallpaperManager()
+            # Skip SetPosition when the fit style is unchanged — a redundant
+            # SetPosition can make Windows restart its wallpaper fade, which
+            # would peek out from behind the overlay when it closes.
+            target = POSITIONS.get(style)
+            use_style = None if mgr.get_position() == target else style
+            mgr.set_wallpaper(path, monitor_index=None, style=use_style)
+
+        return self._transition.play(
+            path, style=style, animation=animation,
+            on_commit=commit, tk_root=self.root,
+            on_done=lambda ok, err:
+                self._events.put(("transition_done", path, ok, err)))
+
+    def _on_transition_done(self, path: str, ok: bool, error) -> None:
+        if ok:
             self._add_history(path)
             self._save_settings()
-            target = "all monitors" if self.monitor is None \
-                else f"monitor {self.monitor}"
             self._status(f"Wallpaper set to {os.path.basename(path)} "
-                         f"({self.style}, {target})")
+                         f"({self.style}, all monitors)")
+        else:
+            self._status(f"Wallpaper change failed: {error}")
 
-        do_set()
+    def _set_wallpaper_now(self, path: str) -> None:
+        try:
+            self.manager.set_wallpaper(path, monitor_index=self.monitor,
+                                       style=self.style)
+        except Exception as exc:
+            self._status(f"Could not set wallpaper: {exc}")
+            return
+        self._add_history(path)
+        self._save_settings()
+        target = "all monitors" if self.monitor is None \
+            else f"monitor {self.monitor}"
+        self._status(f"Wallpaper set to {os.path.basename(path)} "
+                     f"({self.style}, {target})")
 
     def _add_history(self, path: str) -> None:
         if path in self.history:
@@ -324,6 +411,8 @@ class WallpaperApp:
             "monitor": self.monitor,
             "interval": self.interval,
             "shuffle": self.shuffle,
+            "transition": self.transition,
+            "layout": self.layout,
             "hotkey": self.settings.get("hotkey", "alt+w"),
             "history": self.history,
         }
@@ -336,17 +425,61 @@ class WallpaperApp:
     # -- shutdown -------------------------------------------------------------------------
 
     def _on_close(self) -> None:
+        # Idempotent: guard against re-entry if shutdown is slow.
+        if getattr(self, "_closing", False):
+            return
+        self._closing = True
+
+        # Stop background work first so nothing schedules new Tk callbacks
+        # while we're tearing down.
         self._stop_slideshow()
+        self._transition.abort()
         if self._poll_job is not None:
             try:
                 self.root.after_cancel(self._poll_job)
             except tk.TclError:
                 pass
+            self._poll_job = None
+
+        if self.switcher is not None:
+            try:
+                self.switcher.destroy()
+            except Exception:
+                pass
+            self.switcher = None
+
+        self._save_settings()
+
+        # Stop the tray + hotkey threads — their message loops will exit
+        # once they receive the quit/close message.
         self.hotkey.stop()
         self.tray.stop()
-        self.switcher.destroy()
-        self._save_settings()
-        self.root.destroy()
+
+        # Schedule the actual mainloop exit. We can't safely call
+        # root.destroy() from inside an after-callback (it deadlocks Tk),
+        # so defer it by a tick.
+        try:
+            self.root.after(20, self._shutdown_now)
+        except tk.TclError:
+            pass
+
+        # Hard fallback: if Tk is wedged for any reason, force-exit after
+        # a short delay so the process never hangs in the tray.
+        try:
+            self.root.after(1500, lambda: os._exit(0))
+        except tk.TclError:
+            os._exit(0)
+
+    def _shutdown_now(self) -> None:
+        """Actually tear down the Tk root. Called from a fresh after-callback."""
+        try:
+            self.root.quit()   # break out of mainloop
+        except tk.TclError:
+            pass
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
 
 
 def main() -> None:
